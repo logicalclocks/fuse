@@ -1233,7 +1233,6 @@ func TestLink(t *testing.T) {
 
 // Test Rename
 
-// XXX rename2 test
 type rename1 struct {
 	fstestutil.Dir
 	renamed record.Counter
