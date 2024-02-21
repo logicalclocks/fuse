@@ -215,6 +215,10 @@ type NodeRenamer interface {
 	Rename(ctx context.Context, req *fuse.RenameRequest, newDir Node) error
 }
 
+type NodeRenamer2 interface {
+	Rename2(ctx context.Context, req *fuse.Rename2Request, newDir Node) error
+}
+
 type NodeMknoder interface {
 	Mknod(ctx context.Context, req *fuse.MknodRequest) (Node, error)
 }
@@ -845,6 +849,15 @@ type renameNewDirNodeNotFound struct {
 
 func (m *renameNewDirNodeNotFound) String() string {
 	return fmt.Sprintf("In RenameRequest (request %v), node %d not found", m.Request.Hdr().ID, m.In.NewDir)
+}
+
+type rename2NewDirNodeNotFound struct {
+	Request *fuse.Header
+	In      *fuse.Rename2Request
+}
+
+func (m *rename2NewDirNodeNotFound) String() string {
+	return fmt.Sprintf("In Rename2Request (request %v), node %d not found", m.Request.Hdr().ID, m.In.NewDir)
 }
 
 type handlerPanickedError struct {
@@ -1512,6 +1525,32 @@ func (c *Server) handleRequest(ctx context.Context, node Node, snode *serveNode,
 			return syscall.EIO // XXX or EPERM like Mkdir?
 		}
 		err := n.Rename(ctx, r, newDirNode.node)
+		if err != nil {
+			return err
+		}
+		done(nil)
+		r.Respond()
+		return nil
+
+	case *fuse.Rename2Request:
+		c.meta.Lock()
+		var newDirNode *serveNode
+		if int(r.NewDir) < len(c.node) {
+			newDirNode = c.node[r.NewDir]
+		}
+		c.meta.Unlock()
+		if newDirNode == nil {
+			c.debug(rename2NewDirNodeNotFound{
+				Request: r.Hdr(),
+				In:      r,
+			})
+			return syscall.EIO
+		}
+		n, ok := node.(NodeRenamer2)
+		if !ok {
+			return syscall.EIO // XXX or EPERM like Mkdir?
+		}
+		err := n.Rename2(ctx, r, newDirNode.node)
 		if err != nil {
 			return err
 		}
