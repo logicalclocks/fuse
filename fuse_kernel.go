@@ -548,6 +548,13 @@ type renameIn struct {
 	// "oldname\x00newname\x00" follows
 }
 
+type rename2In struct {
+	Newdir  uint64
+	Flags   uint32
+	Padding uint32
+	// "oldname\x00newname\x00" follows
+}
+
 type linkIn struct {
 	Oldnodeid uint64
 }

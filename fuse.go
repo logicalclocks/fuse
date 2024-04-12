@@ -789,6 +789,34 @@ func (c *Conn) ReadRequest() (Request, error) {
 			NewName: newName,
 		}
 
+	case opRename2:
+		in := (*rename2In)(m.data())
+		if m.len() < unsafe.Sizeof(*in) {
+			goto corrupt
+		}
+		newDirNodeID := NodeID(in.Newdir)
+		renameFlags := in.Flags
+		oldNew := m.bytes()[unsafe.Sizeof(*in):]
+		// oldNew should be "old\x00new\x00"
+		if len(oldNew) < 4 {
+			goto corrupt
+		}
+		if oldNew[len(oldNew)-1] != '\x00' {
+			goto corrupt
+		}
+		i := bytes.IndexByte(oldNew, '\x00')
+		if i < 0 {
+			goto corrupt
+		}
+		oldName, newName := string(oldNew[:i]), string(oldNew[i+1:len(oldNew)-1])
+		req = &Rename2Request{
+			Header:  m.Header(),
+			NewDir:  newDirNodeID,
+			Flags:   Rename2Flags(renameFlags),
+			OldName: oldName,
+			NewName: newName,
+		}
+
 	case opOpendir, opOpen:
 		in := (*openIn)(m.data())
 		if m.len() < unsafe.Sizeof(*in) {
@@ -2440,6 +2468,76 @@ func (r *RenameRequest) String() string {
 }
 
 func (r *RenameRequest) Respond() {
+	buf := newBuffer(0)
+	r.respond(buf)
+}
+
+// Rename2 Flags
+type Rename2Flags uint32
+
+const (
+	//Don't overwrite newpath of the rename. Return an error if newpath already exists.
+	//RENAME_NOREPLACE requires support from the underlying filesystem. See the
+	//manpage for more information.
+	RENAME_NOREPLACE = 1 << 0
+
+	//Atomically exchange oldpath and newpath. Both pathnames must exist but may be of
+	//different types (e.g., one could be a non-empty directory and the other a symbolic
+	//link).
+	//RENAME_EXCHANGE can't be used in combination with RENAME_NOREPLACE or RENAME_WHITEOUT.
+	RENAME_EXCHANGE = 1 << 1
+
+	//Specifying RENAME_WHITEOUT creates a "whiteout" object at the source of the rename
+	//at the same time as performing the rename. The whole operation is atomic, so that
+	//if the rename succeeds then the whiteout will also have been created.
+	//This operation makes sense only for overlay/union filesystem implementations.
+	//See the manpage man page for more information.
+	RENAME_WHITEOUT = 1 << 2
+)
+
+func (f Rename2Flags) String() string {
+
+	flags := ""
+	if f&RENAME_NOREPLACE == RENAME_NOREPLACE {
+		if flags != "" {
+			flags += " | "
+		}
+		flags += "RENAME_NOREPLACE"
+	}
+
+	if f&RENAME_EXCHANGE == RENAME_EXCHANGE {
+		if flags != "" {
+			flags += " | "
+		}
+		flags += "RENAME_EXCHANGE"
+	}
+
+	if f&RENAME_WHITEOUT == RENAME_WHITEOUT {
+		if flags != "" {
+			flags += " | "
+		}
+		flags += "RENAME_WHITEOUT"
+	}
+
+	return flags
+}
+
+// A Rename2Request is a request to rename a file.
+type Rename2Request struct {
+	Header           `json:"-"`
+	NewDir           NodeID
+	Flags            Rename2Flags
+	OldName, NewName string
+}
+
+var _ Request = (*Rename2Request)(nil)
+
+func (r *Rename2Request) String() string {
+	return fmt.Sprintf("Rename [%s] from %q to dirnode %v %q. Flags %d",
+		&r.Header, r.OldName, r.NewDir, r.NewName, r.Flags)
+}
+
+func (r *Rename2Request) Respond() {
 	buf := newBuffer(0)
 	r.respond(buf)
 }
