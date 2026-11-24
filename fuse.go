@@ -829,14 +829,15 @@ func (c *Conn) ReadRequest() (Request, error) {
 			OpenFlags: OpenRequestFlags(in.OpenFlags),
 		}
 
-	case opRead, opReaddir:
+	case opRead, opReaddir, opReadDirPlus:
 		in := (*readIn)(m.data())
 		if m.len() < readInSize(c.proto) {
 			goto corrupt
 		}
 		r := &ReadRequest{
 			Header: m.Header(),
-			Dir:    m.hdr.Opcode == opReaddir,
+			Dir:    m.hdr.Opcode == opReaddir || m.hdr.Opcode == opReadDirPlus,
+			Plus:   m.hdr.Opcode == opReadDirPlus,
 			Handle: HandleID(in.Fh),
 			Offset: int64(in.Offset),
 			Size:   int(in.Size),
@@ -1977,7 +1978,8 @@ func (r *MkdirResponse) String() string {
 // A ReadRequest asks to read from an open file.
 type ReadRequest struct {
 	Header    `json:"-"`
-	Dir       bool // is this Readdir?
+	Dir       bool // is this Readdir or Readdirplus?
+	Plus      bool // is this Readdirplus?
 	Handle    HandleID
 	Offset    int64
 	Size      int
@@ -1989,7 +1991,7 @@ type ReadRequest struct {
 var _ Request = (*ReadRequest)(nil)
 
 func (r *ReadRequest) String() string {
-	return fmt.Sprintf("Read [%s] %v %d @%#x dir=%v fl=%v owner=%v ffl=%v", &r.Header, r.Handle, r.Size, r.Offset, r.Dir, r.Flags, r.LockOwner, r.FileFlags)
+	return fmt.Sprintf("Read [%s] %v %d @%#x dir=%v plus=%v fl=%v owner=%v ffl=%v", &r.Header, r.Handle, r.Size, r.Offset, r.Dir, r.Plus, r.Flags, r.LockOwner, r.FileFlags)
 }
 
 // Respond replies to the request with the given response.
@@ -2196,6 +2198,25 @@ func AppendDirentAt(data []byte, dir Dirent, off uint64) []byte {
 		data = append(data, pad[:8-n%8]...)
 	}
 	return data
+}
+
+// DirentPlusSize returns the size of dir's READDIRPLUS record.
+func DirentPlusSize(dir Dirent, proto Protocol) int {
+	return int(entryOutSize(proto)) + (direntSize+len(dir.Name)+7)&^7
+}
+
+// AppendDirentPlus appends the READDIRPLUS record of dir to data, with
+// entry as the result of looking it up and off as the offset to
+// continue after it, and returns the resulting slice. An entry with
+// Node 0 lists the name without attributes: the kernel takes no
+// reference for it and looks it up when it needs it.
+func AppendDirentPlus(data []byte, entry *LookupResponse, dir Dirent, off uint64, proto Protocol) []byte {
+	var out entryOut
+	if entry.Node != 0 {
+		entry.fillEntryOut(&out, proto)
+	}
+	data = append(data, (*[unsafe.Sizeof(entryOut{})]byte)(unsafe.Pointer(&out))[:entryOutSize(proto)]...)
+	return AppendDirentAt(data, dir, off)
 }
 
 // A WriteRequest asks to write to an open file.

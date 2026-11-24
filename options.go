@@ -175,6 +175,19 @@ func ExplicitInvalidateData() MountOption {
 	}
 }
 
+// ReaddirPlus makes the kernel read directories with READDIRPLUS,
+// which carries each entry's attributes with its name, so a stat after
+// a readdir needs no LOOKUP. It takes effect only on kernels that offer
+// it (protocol 7.21, Linux 3.9). The fs package answers it through
+// fs.HandleReadDirPlusAller, and lists names without attributes for
+// directory handles that do not implement it.
+func ReaddirPlus() MountOption {
+	return func(conf *mountConfig) error {
+		conf.initFlags |= InitDoReaddirplus
+		return nil
+	}
+}
+
 // AllowNonEmptyMount allows the mounting over a non-empty directory.
 //
 // The files in it will be shadowed by the freshly created mount. By

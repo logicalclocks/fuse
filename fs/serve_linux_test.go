@@ -10,9 +10,12 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"bazil.org/fuse"
+	"bazil.org/fuse/fs"
 	"bazil.org/fuse/fs/fstestutil"
+	"bazil.org/fuse/fs/fstestutil/record"
 	"bazil.org/fuse/fs/fstestutil/spawntest/httpjson"
 	"golang.org/x/sys/unix"
 )
@@ -210,4 +213,196 @@ func TestReadDirOffsets(t *testing.T) {
 		t.Errorf("getdents after seeking past the end returned %d bytes, want 0", res.PastEnd)
 	}
 	checkNames("after rewinding", res.AfterRewind, want)
+}
+
+// Test READDIRPLUS: a stat after a readdir is answered from the listing,
+// without a LOOKUP, and every node the listing linked is forgotten once
+// the kernel drops it.
+
+type readDirPlusChild struct {
+	size    uint64
+	forgets *record.Counter
+}
+
+func (c *readDirPlusChild) Attr(ctx context.Context, a *fuse.Attr) error {
+	a.Mode = 0o644
+	a.Size = c.size
+	return nil
+}
+
+func (c *readDirPlusChild) Forget() { c.forgets.Inc() }
+
+// readDirPlusDir lists its children and counts lookups; it does not
+// implement LookupPlus.
+type readDirPlusDir struct {
+	fstestutil.Dir
+	names    []string
+	children map[string]*readDirPlusChild
+	lookups  record.Counter
+	forgets  record.Counter
+}
+
+func newReadDirPlusDir(n int) *readDirPlusDir {
+	d := &readDirPlusDir{children: map[string]*readDirPlusChild{}}
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("child-%03d", i)
+		d.names = append(d.names, name)
+		d.children[name] = &readDirPlusChild{size: uint64(i + 1), forgets: &d.forgets}
+	}
+	return d
+}
+
+func (d *readDirPlusDir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	var dirents []fuse.Dirent
+	for i, name := range d.names {
+		dirents = append(dirents, fuse.Dirent{Name: name, Inode: uint64(100 + i), Type: fuse.DT_File})
+	}
+	return dirents, nil
+}
+
+func (d *readDirPlusDir) Lookup(ctx context.Context, name string) (fs.Node, error) {
+	d.lookups.Inc()
+	if c, ok := d.children[name]; ok {
+		return c, nil
+	}
+	return nil, syscall.ENOENT
+}
+
+type readDirPlusLookupDir struct {
+	*readDirPlusDir
+}
+
+var _ fs.HandleReadDirPlusAller = readDirPlusLookupDir{}
+
+func (d readDirPlusLookupDir) LookupPlus(ctx context.Context, name string, attr *fuse.Attr) (fs.Node, bool) {
+	c, ok := d.children[name]
+	if !ok {
+		return nil, false
+	}
+	if err := c.Attr(ctx, attr); err != nil {
+		return nil, false
+	}
+	return c, true
+}
+
+// doReaddirStat lists path and lstats every entry, as ls -l does.
+func doReaddirStat(ctx context.Context, path string) (map[string]int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	names, err := f.Readdirnames(-1)
+	if err != nil {
+		return nil, err
+	}
+	sizes := map[string]int64{}
+	for _, name := range names {
+		fi, err := os.Lstat(path + "/" + name)
+		if err != nil {
+			return nil, err
+		}
+		sizes[name] = fi.Size()
+	}
+	return sizes, nil
+}
+
+var readdirStatHelper = helpers.Register("readdirStat", httpjson.ServePOST(doReaddirStat))
+
+func readDirPlusStat(t *testing.T, root fs.Node, want *readDirPlusDir) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mnt, err := fstestutil.MountedT(t, fstestutil.SimpleFS{Node: root}, nil, fuse.ReaddirPlus())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mnt.Close()
+	if mnt.Conn.Features()&fuse.InitDoReaddirplus == 0 {
+		t.Fatalf("kernel did not take READDIRPLUS: features %v", mnt.Conn.Features())
+	}
+	control := readdirStatHelper.Spawn(ctx, t)
+	defer control.Close()
+
+	var sizes map[string]int64
+	if err := control.JSON("/").Call(ctx, mnt.Dir, &sizes); err != nil {
+		t.Fatalf("calling helper: %v", err)
+	}
+	if len(sizes) != len(want.names) {
+		t.Fatalf("listed %d entries, want %d: %v", len(sizes), len(want.names), sizes)
+	}
+	for _, name := range want.names {
+		if got, want := sizes[name], int64(want.children[name].size); got != want {
+			t.Errorf("%s: size %d, want %d", name, got, want)
+		}
+	}
+}
+
+func TestReadDirPlusServesStatWithoutLookup(t *testing.T) {
+	maybeParallel(t)
+	d := newReadDirPlusDir(20)
+	readDirPlusStat(t, readDirPlusLookupDir{d}, d)
+	if got := d.lookups.Count(); got != 0 {
+		t.Errorf("stat after readdir made %d lookups, want 0", got)
+	}
+}
+
+func TestReadDirPlusFallbackNodeIDZero(t *testing.T) {
+	maybeParallel(t)
+	d := newReadDirPlusDir(20)
+	readDirPlusStat(t, d, d)
+	if got := d.lookups.Count(); got != uint32(len(d.names)) {
+		t.Errorf("stat after readdir made %d lookups, want one per entry, %d", got, len(d.names))
+	}
+}
+
+// doReaddirDropCaches lists path, then drops the kernel's dentry and
+// inode caches, which sends a FORGET for every inode the listing linked.
+func doReaddirDropCaches(ctx context.Context, path string) (*struct{}, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := f.Readdirnames(-1); err != nil {
+		f.Close()
+		return nil, err
+	}
+	f.Close()
+	if err := os.WriteFile("/proc/sys/vm/drop_caches", []byte("2"), 0); err != nil {
+		return nil, err
+	}
+	return &struct{}{}, nil
+}
+
+var readdirDropCachesHelper = helpers.Register("readdirDropCaches", httpjson.ServePOST(doReaddirDropCaches))
+
+func TestReadDirPlusForgetBalances(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("dropping the kernel caches needs root")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := newReadDirPlusDir(50)
+	mnt, err := fstestutil.MountedT(t, fstestutil.SimpleFS{Node: readDirPlusLookupDir{d}}, nil, fuse.ReaddirPlus())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mnt.Close()
+	control := readdirDropCachesHelper.Spawn(ctx, t)
+	defer control.Close()
+
+	if err := control.JSON("/").Call(ctx, mnt.Dir, &struct{}{}); err != nil {
+		t.Fatalf("calling helper: %v", err)
+	}
+	// FORGET arrives asynchronously after the caches are dropped.
+	deadline := time.Now().Add(10 * time.Second)
+	for d.forgets.Count() < uint32(len(d.names)) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := d.forgets.Count(); got != uint32(len(d.names)) {
+		t.Errorf("%d of %d listed nodes were forgotten", got, len(d.names))
+	}
+	if got := d.lookups.Count(); got != 0 {
+		t.Errorf("readdir made %d lookups, want 0", got)
+	}
 }

@@ -295,6 +295,23 @@ type HandleReadDirAller interface {
 	ReadDirAll(ctx context.Context) ([]fuse.Dirent, error)
 }
 
+// HandleReadDirPlusAller is implemented by directory handles that can
+// give the attributes of the entries their ReadDirAll listed, so that
+// READDIRPLUS (see fuse.ReaddirPlus) sends them with the names.
+type HandleReadDirPlusAller interface {
+	HandleReadDirAller
+
+	// LookupPlus returns the node of name, a name the latest
+	// ReadDirAll returned, and fills attr as Node.Attr would: attr
+	// arrives with the defaults Node.Attr gets, and an Inode left 0
+	// gets a dynamic inode. It must not block on the backing store.
+	// ok=true sends attr with the name and takes one reference on n,
+	// as a Lookup does, so n is the node Lookup would return for name.
+	// ok=false sends the entry without attributes, and the kernel looks
+	// it up when it needs them. It is not called for "." and "..".
+	LookupPlus(ctx context.Context, name string, attr *fuse.Attr) (n Node, ok bool)
+}
+
 type HandleReader interface {
 	// Read requests to read data from the handle.
 	//
@@ -623,6 +640,23 @@ type nodeRefcountDropBug struct {
 
 func (n nodeRefcountDropBug) String() string {
 	return fmt.Sprintf("bug: trying to drop %d of %d references to %v", n.N, n.Refs, n.Node)
+}
+
+// forgetNode drops n references to the node with id and calls its
+// Forget when none is left.
+func (c *Server) forgetNode(id fuse.NodeID, n uint64) {
+	node, forget := c.dropNode(id, n)
+	// node is nil while references remain, and when the refcounts of
+	// the kernel and this server disagree and two forgets raced (see
+	// dropNode); either way there is no node to call Forget on.
+	if node == nil {
+		return
+	}
+	if forget {
+		if f, ok := node.(NodeForgetter); ok {
+			f.Forget()
+		}
+	}
 }
 
 // dropNode decreases reference count for node with id by n.
@@ -1353,32 +1387,18 @@ func (c *Server) handleRequest(ctx context.Context, node Node, snode *serveNode,
 		return nil
 
 	case *fuse.BatchForgetRequest:
-		// BatchForgetRequest is hard to unit test, as it
-		// fundamentally relies on something unprivileged userspace
-		// has little control over. A root-only, Linux-only test could
-		// be written with `echo 2 >/proc/sys/vm/drop_caches`, but
-		// that would still rely on timing, the number of batches and
-		// operation spread over them could vary, it wouldn't run in a
-		// typical container regardless of privileges, and it would
-		// degrade performance for the rest of the machine. It would
-		// still probably be worth doing, just not the most fun.
+		// BatchForgetRequest relies on the kernel evicting inodes,
+		// which unprivileged userspace has little control over.
+		// TestReadDirPlusForgetBalances evicts them as root with
+		// `echo 2 >/proc/sys/vm/drop_caches` and checks that every
+		// node is forgotten; whether the kernel sends FORGET or
+		// BATCH_FORGET, and in how many batches, is outside its
+		// control.
 
 		// node is nil here because BatchForget as a message is not
 		// aimed at a any one node
 		for _, item := range r.Forget {
-			node, forget := c.dropNode(item.NodeID, item.N)
-			// node can be nil here if kernel vs our refcount were out
-			// of sync and multiple Forgets raced each other
-			if node == nil {
-				// nothing we can do about that
-				continue
-			}
-			if forget {
-				n, ok := node.(NodeForgetter)
-				if ok {
-					n.Forget()
-				}
-			}
+			c.forgetNode(item.NodeID, item.N)
 		}
 		done(nil)
 		r.Respond()
@@ -1415,7 +1435,14 @@ func (c *Server) handleRequest(ctx context.Context, node Node, snode *serveNode,
 					}
 					shandle.dirents = dirents
 				}
-				data, err := appendDirents(s.Data, shandle.dirents, r.Offset, r.Size)
+				var data []byte
+				var err error
+				if r.Plus {
+					plus, _ := handle.(HandleReadDirPlusAller)
+					data, err = c.appendDirentsPlus(ctx, s.Data, shandle.dirents, r.Offset, r.Size, r.Conn.Protocol(), snode, plus)
+				} else {
+					data, err = appendDirents(s.Data, shandle.dirents, r.Offset, r.Size)
+				}
 				if err != nil {
 					return err
 				}
