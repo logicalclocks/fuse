@@ -27,10 +27,10 @@ func platformStat(fi os.FileInfo) *statResult {
 	}
 	st := fi.Sys().(*syscall.Stat_t)
 	r.Ino = st.Ino
-	r.Nlink = st.Nlink
+	r.Nlink = uint64(st.Nlink)
 	r.UID = st.Uid
 	r.GID = st.Gid
-	r.Blksize = st.Blksize
+	r.Blksize = int64(st.Blksize)
 	return r
 }
 
