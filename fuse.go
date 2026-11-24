@@ -1832,13 +1832,7 @@ func (r *LookupRequest) Respond(resp *LookupResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
 	buf := newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
-	out.Nodeid = uint64(resp.Node)
-	out.Generation = resp.Generation
-	out.EntryValid = uint64(resp.EntryValid / time.Second)
-	out.EntryValidNsec = uint32(resp.EntryValid % time.Second / time.Nanosecond)
-	out.AttrValid = uint64(resp.Attr.Valid / time.Second)
-	out.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
-	resp.Attr.attr(&out.Attr, r.Header.Conn.proto)
+	resp.fillEntryOut(out, r.Header.Conn.proto)
 	r.respond(buf)
 }
 
@@ -1856,6 +1850,16 @@ func (r *LookupResponse) string() string {
 
 func (r *LookupResponse) String() string {
 	return fmt.Sprintf("Lookup %s", r.string())
+}
+
+func (r *LookupResponse) fillEntryOut(out *entryOut, p Protocol) {
+	out.Nodeid = uint64(r.Node)
+	out.Generation = r.Generation
+	out.EntryValid = uint64(r.EntryValid / time.Second)
+	out.EntryValidNsec = uint32(r.EntryValid % time.Second / time.Nanosecond)
+	out.AttrValid = uint64(r.Attr.Valid / time.Second)
+	out.AttrValidNsec = uint32(r.Attr.Valid % time.Second / time.Nanosecond)
+	r.Attr.attr(&out.Attr, p)
 }
 
 // An OpenRequest asks to open a file or directory
@@ -1917,13 +1921,7 @@ func (r *CreateRequest) Respond(resp *CreateResponse) {
 	buf := newBuffer(eSize + unsafe.Sizeof(openOut{}))
 
 	e := (*entryOut)(buf.alloc(eSize))
-	e.Nodeid = uint64(resp.Node)
-	e.Generation = resp.Generation
-	e.EntryValid = uint64(resp.EntryValid / time.Second)
-	e.EntryValidNsec = uint32(resp.EntryValid % time.Second / time.Nanosecond)
-	e.AttrValid = uint64(resp.Attr.Valid / time.Second)
-	e.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
-	resp.Attr.attr(&e.Attr, r.Header.Conn.proto)
+	resp.fillEntryOut(e, r.Header.Conn.proto)
 
 	o := (*openOut)(buf.alloc(unsafe.Sizeof(openOut{})))
 	o.Fh = uint64(resp.Handle)
@@ -1963,13 +1961,7 @@ func (r *MkdirRequest) Respond(resp *MkdirResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
 	buf := newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
-	out.Nodeid = uint64(resp.Node)
-	out.Generation = resp.Generation
-	out.EntryValid = uint64(resp.EntryValid / time.Second)
-	out.EntryValidNsec = uint32(resp.EntryValid % time.Second / time.Nanosecond)
-	out.AttrValid = uint64(resp.Attr.Valid / time.Second)
-	out.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
-	resp.Attr.attr(&out.Attr, r.Header.Conn.proto)
+	resp.fillEntryOut(out, r.Header.Conn.proto)
 	r.respond(buf)
 }
 
@@ -2391,13 +2383,7 @@ func (r *SymlinkRequest) Respond(resp *SymlinkResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
 	buf := newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
-	out.Nodeid = uint64(resp.Node)
-	out.Generation = resp.Generation
-	out.EntryValid = uint64(resp.EntryValid / time.Second)
-	out.EntryValidNsec = uint32(resp.EntryValid % time.Second / time.Nanosecond)
-	out.AttrValid = uint64(resp.Attr.Valid / time.Second)
-	out.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
-	resp.Attr.attr(&out.Attr, r.Header.Conn.proto)
+	resp.fillEntryOut(out, r.Header.Conn.proto)
 	r.respond(buf)
 }
 
@@ -2444,13 +2430,7 @@ func (r *LinkRequest) Respond(resp *LookupResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
 	buf := newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
-	out.Nodeid = uint64(resp.Node)
-	out.Generation = resp.Generation
-	out.EntryValid = uint64(resp.EntryValid / time.Second)
-	out.EntryValidNsec = uint32(resp.EntryValid % time.Second / time.Nanosecond)
-	out.AttrValid = uint64(resp.Attr.Valid / time.Second)
-	out.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
-	resp.Attr.attr(&out.Attr, r.Header.Conn.proto)
+	resp.fillEntryOut(out, r.Header.Conn.proto)
 	r.respond(buf)
 }
 
@@ -2561,13 +2541,7 @@ func (r *MknodRequest) Respond(resp *LookupResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
 	buf := newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
-	out.Nodeid = uint64(resp.Node)
-	out.Generation = resp.Generation
-	out.EntryValid = uint64(resp.EntryValid / time.Second)
-	out.EntryValidNsec = uint32(resp.EntryValid % time.Second / time.Nanosecond)
-	out.AttrValid = uint64(resp.Attr.Valid / time.Second)
-	out.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
-	resp.Attr.attr(&out.Attr, r.Header.Conn.proto)
+	resp.fillEntryOut(out, r.Header.Conn.proto)
 	r.respond(buf)
 }
 
