@@ -569,6 +569,10 @@ func (sn *serveNode) attr(ctx context.Context, attr *fuse.Attr) error {
 type serveHandle struct {
 	handle   Handle
 	readData []byte
+	// dirents is a copy of a directory handle's ReadDirAll result with
+	// the dynamic inodes filled in, kept until the next readdir at
+	// offset 0: readdir offsets are indexes into it.
+	dirents []fuse.Dirent
 }
 
 func (c *Server) saveNode(inode uint64, node Node) (id fuse.NodeID, gen uint64) {
@@ -1394,24 +1398,28 @@ func (c *Server) handleRequest(ctx context.Context, node Node, snode *serveNode,
 				// detect rewinddir(3) or similar seek and refresh
 				// contents
 				if r.Offset == 0 {
-					shandle.readData = nil
+					shandle.dirents = nil
 				}
 
-				if shandle.readData == nil {
+				if shandle.dirents == nil {
 					dirs, err := h.ReadDirAll(ctx)
 					if err != nil {
 						return err
 					}
-					var data []byte
-					for _, dir := range dirs {
-						if dir.Inode == 0 {
-							dir.Inode = c.dynamicInode(snode.inode, dir.Name)
+					dirents := make([]fuse.Dirent, len(dirs))
+					copy(dirents, dirs)
+					for i := range dirents {
+						if dirents[i].Inode == 0 {
+							dirents[i].Inode = c.dynamicInode(snode.inode, dirents[i].Name)
 						}
-						data = fuse.AppendDirent(data, dir)
 					}
-					shandle.readData = data
+					shandle.dirents = dirents
 				}
-				fuseutil.HandleRead(r, s, shandle.readData)
+				data, err := appendDirents(s.Data, shandle.dirents, r.Offset, r.Size)
+				if err != nil {
+					return err
+				}
+				s.Data = data
 				done(s)
 				r.Respond(s)
 				return nil
