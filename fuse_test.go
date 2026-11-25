@@ -56,11 +56,12 @@ func TestFeatures(t *testing.T) {
 		})
 	}
 
-	run("bare", 0, fuse.InitPOSIXLocks|fuse.InitFlockLocks)
+	run("bare", 0, fuse.InitPOSIXLocks|fuse.InitFlockLocks|fuse.InitDoReaddirplus)
 	run("LockingFlock", fuse.InitFlockLocks, 0, fuse.LockingFlock())
 	run("LockingPOSIX", fuse.InitPOSIXLocks, 0, fuse.LockingPOSIX())
 	run("AsyncRead", fuse.InitAsyncRead, 0, fuse.AsyncRead())
 	run("WritebackCache", fuse.InitWritebackCache, 0, fuse.WritebackCache())
 	run("CacheSymlinks", fuse.InitCacheSymlinks, 0, fuse.CacheSymlinks())
 	run("ExplicitInvalidateData", fuse.InitExplicitInvalidateData, 0, fuse.ExplicitInvalidateData())
+	run("ReaddirPlus", fuse.InitDoReaddirplus, fuse.InitReaddirplusAuto, fuse.ReaddirPlus())
 }

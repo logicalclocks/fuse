@@ -829,14 +829,15 @@ func (c *Conn) ReadRequest() (Request, error) {
 			OpenFlags: OpenRequestFlags(in.OpenFlags),
 		}
 
-	case opRead, opReaddir:
+	case opRead, opReaddir, opReadDirPlus:
 		in := (*readIn)(m.data())
 		if m.len() < readInSize(c.proto) {
 			goto corrupt
 		}
 		r := &ReadRequest{
 			Header: m.Header(),
-			Dir:    m.hdr.Opcode == opReaddir,
+			Dir:    m.hdr.Opcode == opReaddir || m.hdr.Opcode == opReadDirPlus,
+			Plus:   m.hdr.Opcode == opReadDirPlus,
 			Handle: HandleID(in.Fh),
 			Offset: int64(in.Offset),
 			Size:   int(in.Size),
@@ -1832,13 +1833,7 @@ func (r *LookupRequest) Respond(resp *LookupResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
 	buf := newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
-	out.Nodeid = uint64(resp.Node)
-	out.Generation = resp.Generation
-	out.EntryValid = uint64(resp.EntryValid / time.Second)
-	out.EntryValidNsec = uint32(resp.EntryValid % time.Second / time.Nanosecond)
-	out.AttrValid = uint64(resp.Attr.Valid / time.Second)
-	out.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
-	resp.Attr.attr(&out.Attr, r.Header.Conn.proto)
+	resp.fillEntryOut(out, r.Header.Conn.proto)
 	r.respond(buf)
 }
 
@@ -1856,6 +1851,16 @@ func (r *LookupResponse) string() string {
 
 func (r *LookupResponse) String() string {
 	return fmt.Sprintf("Lookup %s", r.string())
+}
+
+func (r *LookupResponse) fillEntryOut(out *entryOut, p Protocol) {
+	out.Nodeid = uint64(r.Node)
+	out.Generation = r.Generation
+	out.EntryValid = uint64(r.EntryValid / time.Second)
+	out.EntryValidNsec = uint32(r.EntryValid % time.Second / time.Nanosecond)
+	out.AttrValid = uint64(r.Attr.Valid / time.Second)
+	out.AttrValidNsec = uint32(r.Attr.Valid % time.Second / time.Nanosecond)
+	r.Attr.attr(&out.Attr, p)
 }
 
 // An OpenRequest asks to open a file or directory
@@ -1917,13 +1922,7 @@ func (r *CreateRequest) Respond(resp *CreateResponse) {
 	buf := newBuffer(eSize + unsafe.Sizeof(openOut{}))
 
 	e := (*entryOut)(buf.alloc(eSize))
-	e.Nodeid = uint64(resp.Node)
-	e.Generation = resp.Generation
-	e.EntryValid = uint64(resp.EntryValid / time.Second)
-	e.EntryValidNsec = uint32(resp.EntryValid % time.Second / time.Nanosecond)
-	e.AttrValid = uint64(resp.Attr.Valid / time.Second)
-	e.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
-	resp.Attr.attr(&e.Attr, r.Header.Conn.proto)
+	resp.fillEntryOut(e, r.Header.Conn.proto)
 
 	o := (*openOut)(buf.alloc(unsafe.Sizeof(openOut{})))
 	o.Fh = uint64(resp.Handle)
@@ -1963,13 +1962,7 @@ func (r *MkdirRequest) Respond(resp *MkdirResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
 	buf := newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
-	out.Nodeid = uint64(resp.Node)
-	out.Generation = resp.Generation
-	out.EntryValid = uint64(resp.EntryValid / time.Second)
-	out.EntryValidNsec = uint32(resp.EntryValid % time.Second / time.Nanosecond)
-	out.AttrValid = uint64(resp.Attr.Valid / time.Second)
-	out.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
-	resp.Attr.attr(&out.Attr, r.Header.Conn.proto)
+	resp.fillEntryOut(out, r.Header.Conn.proto)
 	r.respond(buf)
 }
 
@@ -1985,7 +1978,8 @@ func (r *MkdirResponse) String() string {
 // A ReadRequest asks to read from an open file.
 type ReadRequest struct {
 	Header    `json:"-"`
-	Dir       bool // is this Readdir?
+	Dir       bool // is this Readdir or Readdirplus?
+	Plus      bool // is this Readdirplus?
 	Handle    HandleID
 	Offset    int64
 	Size      int
@@ -1997,7 +1991,7 @@ type ReadRequest struct {
 var _ Request = (*ReadRequest)(nil)
 
 func (r *ReadRequest) String() string {
-	return fmt.Sprintf("Read [%s] %v %d @%#x dir=%v fl=%v owner=%v ffl=%v", &r.Header, r.Handle, r.Size, r.Offset, r.Dir, r.Flags, r.LockOwner, r.FileFlags)
+	return fmt.Sprintf("Read [%s] %v %d @%#x dir=%v plus=%v fl=%v owner=%v ffl=%v", &r.Header, r.Handle, r.Size, r.Offset, r.Dir, r.Plus, r.Flags, r.LockOwner, r.FileFlags)
 }
 
 // Respond replies to the request with the given response.
@@ -2181,14 +2175,21 @@ func (t DirentType) String() string {
 }
 
 // AppendDirent appends the encoded form of a directory entry to data
-// and returns the resulting slice.
+// and returns the resulting slice. The entry's offset is its end in data.
 func AppendDirent(data []byte, dir Dirent) []byte {
+	return AppendDirentAt(data, dir, uint64(len(data)+direntSize+(len(dir.Name)+7)&^7))
+}
+
+// AppendDirentAt is AppendDirent with the entry's offset given: the
+// value the kernel sends back in a later readdir request to continue
+// after this entry.
+func AppendDirentAt(data []byte, dir Dirent, off uint64) []byte {
 	de := dirent{
 		Ino:     dir.Inode,
+		Off:     off,
 		Namelen: uint32(len(dir.Name)),
 		Type:    uint32(dir.Type),
 	}
-	de.Off = uint64(len(data) + direntSize + (len(dir.Name)+7)&^7)
 	data = append(data, (*[direntSize]byte)(unsafe.Pointer(&de))[:]...)
 	data = append(data, dir.Name...)
 	n := direntSize + uintptr(len(dir.Name))
@@ -2197,6 +2198,25 @@ func AppendDirent(data []byte, dir Dirent) []byte {
 		data = append(data, pad[:8-n%8]...)
 	}
 	return data
+}
+
+// DirentPlusSize returns the size of dir's READDIRPLUS record.
+func DirentPlusSize(dir Dirent, proto Protocol) int {
+	return int(entryOutSize(proto)) + (direntSize+len(dir.Name)+7)&^7
+}
+
+// AppendDirentPlus appends the READDIRPLUS record of dir to data, with
+// entry as the result of looking it up and off as the offset to
+// continue after it, and returns the resulting slice. An entry with
+// Node 0 lists the name without attributes: the kernel takes no
+// reference for it and looks it up when it needs it.
+func AppendDirentPlus(data []byte, entry *LookupResponse, dir Dirent, off uint64, proto Protocol) []byte {
+	var out entryOut
+	if entry.Node != 0 {
+		entry.fillEntryOut(&out, proto)
+	}
+	data = append(data, (*[unsafe.Sizeof(entryOut{})]byte)(unsafe.Pointer(&out))[:entryOutSize(proto)]...)
+	return AppendDirentAt(data, dir, off)
 }
 
 // A WriteRequest asks to write to an open file.
@@ -2391,13 +2411,7 @@ func (r *SymlinkRequest) Respond(resp *SymlinkResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
 	buf := newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
-	out.Nodeid = uint64(resp.Node)
-	out.Generation = resp.Generation
-	out.EntryValid = uint64(resp.EntryValid / time.Second)
-	out.EntryValidNsec = uint32(resp.EntryValid % time.Second / time.Nanosecond)
-	out.AttrValid = uint64(resp.Attr.Valid / time.Second)
-	out.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
-	resp.Attr.attr(&out.Attr, r.Header.Conn.proto)
+	resp.fillEntryOut(out, r.Header.Conn.proto)
 	r.respond(buf)
 }
 
@@ -2444,13 +2458,7 @@ func (r *LinkRequest) Respond(resp *LookupResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
 	buf := newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
-	out.Nodeid = uint64(resp.Node)
-	out.Generation = resp.Generation
-	out.EntryValid = uint64(resp.EntryValid / time.Second)
-	out.EntryValidNsec = uint32(resp.EntryValid % time.Second / time.Nanosecond)
-	out.AttrValid = uint64(resp.Attr.Valid / time.Second)
-	out.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
-	resp.Attr.attr(&out.Attr, r.Header.Conn.proto)
+	resp.fillEntryOut(out, r.Header.Conn.proto)
 	r.respond(buf)
 }
 
@@ -2561,13 +2569,7 @@ func (r *MknodRequest) Respond(resp *LookupResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
 	buf := newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
-	out.Nodeid = uint64(resp.Node)
-	out.Generation = resp.Generation
-	out.EntryValid = uint64(resp.EntryValid / time.Second)
-	out.EntryValidNsec = uint32(resp.EntryValid % time.Second / time.Nanosecond)
-	out.AttrValid = uint64(resp.Attr.Valid / time.Second)
-	out.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
-	resp.Attr.attr(&out.Attr, r.Header.Conn.proto)
+	resp.fillEntryOut(out, r.Header.Conn.proto)
 	r.respond(buf)
 }
 
