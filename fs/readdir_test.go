@@ -167,18 +167,18 @@ func decodeDirentsPlus(t *testing.T, buf []byte) []plusRecord {
 			t.Fatalf("partial record header: %d bytes left", len(buf))
 		}
 		d := buf[entrySize:]
-		namelen := int(binary.LittleEndian.Uint32(d[16:20]))
+		namelen := int(hostEndian.Uint32(d[16:20]))
 		reclen := entrySize + (24+namelen+7)&^7
 		if len(buf) < reclen {
 			t.Fatalf("partial record: %d bytes left, record is %d", len(buf), reclen)
 		}
 		out = append(out, plusRecord{
-			nodeID:     binary.LittleEndian.Uint64(buf[0:8]),
-			generation: binary.LittleEndian.Uint64(buf[8:16]),
-			size:       binary.LittleEndian.Uint64(buf[48:56]),
-			mode:       binary.LittleEndian.Uint32(buf[100:104]),
+			nodeID:     hostEndian.Uint64(buf[0:8]),
+			generation: hostEndian.Uint64(buf[8:16]),
+			size:       hostEndian.Uint64(buf[48:56]),
+			mode:       hostEndian.Uint32(buf[100:104]),
 			name:       string(d[24 : 24+namelen]),
-			off:        binary.LittleEndian.Uint64(d[8:16]),
+			off:        hostEndian.Uint64(d[8:16]),
 		})
 		buf = buf[reclen:]
 	}
@@ -329,6 +329,40 @@ func TestAppendDirentsPlusDotEntriesTakeNoReferences(t *testing.T) {
 	}
 	if r := got[2]; r.nodeID == 0 || c.testRefs(lookup.nodes["a"]) != 1 {
 		t.Errorf("%q: node %d with %d references; want a node with 1", r.name, r.nodeID, c.testRefs(lookup.nodes["a"]))
+	}
+}
+
+// panicLookup answers as plusTestLookup does and panics on panicOn.
+type panicLookup struct {
+	plusTestLookup
+	panicOn string
+}
+
+func (l *panicLookup) LookupPlus(ctx context.Context, name string, attr *fuse.Attr) (Node, bool) {
+	if name == l.panicOn {
+		panic("LookupPlus failed")
+	}
+	return l.plusTestLookup.LookupPlus(ctx, name, attr)
+}
+
+// serve answers a request whose handler panicked with an error, so the
+// kernel never sees the records before it and cannot return their
+// references.
+func TestAppendDirentsPlusPanickingLookupReleases(t *testing.T) {
+	c, root := newPlusTestServer()
+	node := &plusTestNode{size: 1}
+	dirents := []fuse.Dirent{{Name: "good", Inode: 10}, {Name: "bad", Inode: 11}}
+	lookup := &panicLookup{plusTestLookup{nodes: map[string]*plusTestNode{"good": node}}, "bad"}
+	panicked := func() (p bool) {
+		defer func() { p = recover() != nil }()
+		c.appendDirentsPlus(context.Background(), nil, dirents, 0, 4096, testProto, root, lookup)
+		return false
+	}()
+	if !panicked {
+		t.Fatal("LookupPlus did not panic")
+	}
+	if refs := c.testRefs(node); refs != 0 || node.forgets != 1 {
+		t.Errorf("earlier node holds %d references, forgotten %d times; want released and forgotten once", refs, node.forgets)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
@@ -108,6 +109,16 @@ type readdirOffsetsResult struct {
 	AfterRewind []string
 }
 
+// The encoders and the kernel write dirents in the host's byte order.
+var hostEndian binary.ByteOrder = binary.LittleEndian
+
+func init() {
+	one := uint16(1)
+	if *(*byte)(unsafe.Pointer(&one)) == 0 {
+		hostEndian = binary.BigEndian
+	}
+}
+
 // getdentsNames reads fd to the end in getdents calls of bufSize bytes and
 // returns each name with the offset getdents gave it.
 func getdentsNames(fd int, bufSize int) ([]string, []int64, error) {
@@ -123,13 +134,13 @@ func getdentsNames(fd int, bufSize int) ([]string, []int64, error) {
 			return names, offs, nil
 		}
 		for b := buf[:n]; len(b) > 0; {
-			reclen := int(binary.LittleEndian.Uint16(b[16:18]))
+			reclen := int(hostEndian.Uint16(b[16:18]))
 			name := b[19:reclen]
 			if i := bytes.IndexByte(name, 0); i >= 0 {
 				name = name[:i]
 			}
 			names = append(names, string(name))
-			offs = append(offs, int64(binary.LittleEndian.Uint64(b[8:16])))
+			offs = append(offs, int64(hostEndian.Uint64(b[8:16])))
 			b = b[reclen:]
 		}
 	}

@@ -60,12 +60,20 @@ func (c *Server) appendDirentsPlus(ctx context.Context, buf []byte, dirents []fu
 	}
 	start := len(buf)
 	var refs []fuse.NodeID
-	for i := offset; i < int64(len(dirents)); i++ {
-		dir := dirents[i]
-		if !validDirentPlusName(dir.Name) {
+	// Unless the reply is built, the kernel never sees these records:
+	// on an invalid name, and when lookup panics or calls
+	// runtime.Goexit, which serve answers with an error.
+	built := false
+	defer func() {
+		if !built {
 			for _, id := range refs {
 				c.forgetNode(id, 1)
 			}
+		}
+	}()
+	for i := offset; i < int64(len(dirents)); i++ {
+		dir := dirents[i]
+		if !validDirentPlusName(dir.Name) {
 			log.Printf("fuse: readdirplus: invalid name %q in directory %v, failing the request", dir.Name, parent.node)
 			return buf[:start], syscall.EIO
 		}
@@ -91,5 +99,6 @@ func (c *Server) appendDirentsPlus(ctx context.Context, buf []byte, dirents []fu
 		}
 		buf = fuse.AppendDirentPlus(buf, &entry, dir, uint64(i+1), proto)
 	}
+	built = true
 	return buf, nil
 }
