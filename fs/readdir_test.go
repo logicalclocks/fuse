@@ -8,9 +8,20 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"unsafe"
 
 	"bazil.org/fuse"
 )
+
+// The encoders and the kernel write dirents in the host's byte order.
+var hostEndian binary.ByteOrder = binary.LittleEndian
+
+func init() {
+	one := uint16(1)
+	if *(*byte)(unsafe.Pointer(&one)) == 0 {
+		hostEndian = binary.BigEndian
+	}
+}
 
 type decodedDirent struct {
 	name string
@@ -26,8 +37,8 @@ func decodeDirents(t *testing.T, buf []byte) []decodedDirent {
 		if len(buf) < 24 {
 			t.Fatalf("partial record header: %d bytes left", len(buf))
 		}
-		off := binary.LittleEndian.Uint64(buf[8:16])
-		namelen := int(binary.LittleEndian.Uint32(buf[16:20]))
+		off := hostEndian.Uint64(buf[8:16])
+		namelen := int(hostEndian.Uint32(buf[16:20]))
 		reclen := (24 + namelen + 7) &^ 7
 		if len(buf) < reclen {
 			t.Fatalf("partial record: %d bytes left, record is %d", len(buf), reclen)
