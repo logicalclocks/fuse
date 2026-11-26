@@ -211,6 +211,44 @@ type NodeForgetter interface {
 	Forget()
 }
 
+// NodeRetirer is an optional interface for nodes of a filesystem that
+// keeps its own name-to-node cache and wants to drop a node from it exactly
+// when the kernel drops its last reference.
+//
+// Both methods run while the server holds its internal metadata mutex, which
+// makes retirement and registration mutually exclusive. They must not block
+// and must not call back into the Server (no Invalidate*, no Notify*).
+//
+// Nodes that do not implement this interface keep the existing behaviour:
+// Forget is called after the metadata mutex is released.
+type NodeRetirer interface {
+	// RegisterLocked is called before the server starts tracking this node
+	// for an entry reply (Lookup, Create, Mkdir, Symlink, Link, Mknod). It
+	// is not called when the server already tracks the node. Returning
+	// false refuses the registration and fails the reply with ESTALE. A
+	// node must return false once RetireLocked has been called on it.
+	//
+	// The kernel answers ESTALE on a Lookup by repeating the lookup. On a
+	// creating operation (Create, Mkdir, Symlink, Mknod) the filesystem has
+	// already made the entry, and the kernel repeats the whole system call
+	// once, which then fails with EEXIST for an exclusive create or a
+	// mkdir. A creating operation must therefore return a node that cannot
+	// have retired: one made for that call, never one taken from a cache.
+	RegisterLocked() bool
+	// RetireLocked is called when the server's reference count for this
+	// node reaches zero, in place of Forget.
+	RetireLocked()
+}
+
+// HandleAbandoner is an optional interface for handles returned by
+// NodeCreater.Create. Abandon is called when the server fails the Create
+// before replying, because the new node's Attr failed or its registration
+// was refused, so no Release will ever arrive for the handle. It is not
+// called when the kernel rejects a reply that was sent.
+type HandleAbandoner interface {
+	Abandon(ctx context.Context)
+}
+
 type NodeRenamer interface {
 	Rename(ctx context.Context, req *fuse.RenameRequest, newDir Node) error
 }
@@ -432,7 +470,38 @@ type Config struct {
 	//
 	// Must not retain req.
 	WithContext func(ctx context.Context, req fuse.Request) context.Context
+
+	// InlineForget processes FORGET and BATCH_FORGET requests on the
+	// request-reading goroutine instead of spawning a goroutine per
+	// request. Forgets carry no reply and touch no filesystem state
+	// beyond reference counting, so this bounds the memory a forget
+	// storm can hold (one pooled request buffer instead of one per
+	// in-flight request).
+	//
+	// Only enable this when Forget and RetireLocked implementations never
+	// block.
+	//
+	// dropNode waits, holding the server's metadata lock, for in-flight
+	// notifications on the node it frees, and with this set it waits on
+	// the goroutine that reads requests. Two notifications can deadlock
+	// against that, and return ErrInlineForget on a server with this set.
+	// NotifyDelete holds the child, whose FORGET can arrive while the
+	// write waits for a request that needs the metadata lock to finish.
+	// NotifyRetrieve needs the reading goroutine to deliver its reply.
+	//
+	// InvalidateEntry is safe: it holds only the parent directory, and the
+	// kernel forgets a directory only once nothing uses it, so the write
+	// cannot be queued behind a request on the directory. The
+	// InvalidateNode calls and NotifyStore are not refused. The kernel
+	// sends a node's last FORGET only after it evicted the inode, and these
+	// notifications fail at once on an evicted inode, so the same reasoning
+	// covers them, but no test here runs them with InlineForget.
+	InlineForget bool
 }
+
+// ErrInlineForget is returned by the notifications that can deadlock a
+// server running with Config.InlineForget.
+var ErrInlineForget = errors.New("fuse: notification not available with InlineForget")
 
 // New returns a new FUSE server ready to serve this kernel FUSE
 // connection.
@@ -449,6 +518,7 @@ func New(conn *fuse.Conn, config *Config) *Server {
 	if config != nil {
 		s.debug = config.Debug
 		s.context = config.WithContext
+		s.inlineForget = config.InlineForget
 	}
 	if s.debug == nil {
 		s.debug = fuse.Debug
@@ -458,9 +528,10 @@ func New(conn *fuse.Conn, config *Config) *Server {
 
 type Server struct {
 	// set in New
-	conn    *fuse.Conn
-	debug   func(msg interface{})
-	context func(ctx context.Context, req fuse.Request) context.Context
+	conn         *fuse.Conn
+	debug        func(msg interface{})
+	context      func(ctx context.Context, req fuse.Request) context.Context
+	inlineForget bool
 
 	// set once at Serve time
 	fs           FS
@@ -520,6 +591,14 @@ func (s *Server) Serve(fs FS) error {
 			return err
 		}
 
+		if s.inlineForget {
+			switch req.(type) {
+			case *fuse.ForgetRequest, *fuse.BatchForgetRequest:
+				s.serveForget(req)
+				continue
+			}
+		}
+
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -527,6 +606,47 @@ func (s *Server) Serve(fs FS) error {
 		}()
 	}
 	return nil
+}
+
+// serveForget handles a FORGET or BATCH_FORGET request on the calling
+// goroutine. Forgets have no reply, cannot be interrupted, and are not
+// registered in c.req. Unknown or stale node IDs are logged and ignored;
+// writing an error reply for a no-reply opcode would be a protocol bug.
+func (s *Server) serveForget(r fuse.Request) {
+	s.debug(request{In: r})
+	switch r := r.(type) {
+	case *fuse.ForgetRequest:
+		s.forgetOne(r.Hdr().Node, r.N)
+		// Respond returns the pooled request buffer; it writes nothing.
+		r.Respond()
+	case *fuse.BatchForgetRequest:
+		for _, item := range r.Forget {
+			s.forgetOne(item.NodeID, item.N)
+		}
+		r.Respond()
+	}
+}
+
+// forgetOne drops n references from the node with the given ID and runs
+// the node's Forget hook when the count reaches zero. NodeRetirer nodes are
+// retired inside dropNode (under c.meta); plain nodes get Forget here.
+func (s *Server) forgetOne(id fuse.NodeID, n uint64) {
+	// The recovery in serve does not cover the request-reading goroutine,
+	// where a panicking hook would end Serve.
+	defer func() {
+		if rec := recover(); rec != nil {
+			buf := make([]byte, 1<<16)
+			buf = buf[:runtime.Stack(buf, false)]
+			log.Printf("fuse: panic forgetting node %v: %v\n%s", id, rec, buf)
+		}
+	}()
+	node, forget := s.dropNode(id, n)
+	if node == nil || !forget {
+		return
+	}
+	if f, ok := node.(NodeForgetter); ok {
+		f.Forget()
+	}
 }
 
 // Serve serves a FUSE connection with the default settings. See
@@ -571,14 +691,20 @@ type serveHandle struct {
 	readData []byte
 }
 
-func (c *Server) saveNode(inode uint64, node Node) (id fuse.NodeID, gen uint64) {
+// saveNode starts tracking node, or adds a reference if it is already
+// tracked. ok is false when a NodeRetirer refused the registration.
+func (c *Server) saveNode(inode uint64, node Node) (id fuse.NodeID, gen uint64, ok bool) {
 	c.meta.Lock()
 	defer c.meta.Unlock()
 
 	if id, ok := c.nodeRef[node]; ok {
 		sn := c.node[id]
 		sn.refs++
-		return id, sn.generation
+		return id, sn.generation, true
+	}
+
+	if r, ok := node.(NodeRetirer); ok && !r.RegisterLocked() {
+		return 0, 0, false
 	}
 
 	sn := &serveNode{inode: inode, node: node, refs: 1}
@@ -593,7 +719,7 @@ func (c *Server) saveNode(inode uint64, node Node) (id fuse.NodeID, gen uint64) 
 	}
 	sn.generation = c.nodeGen
 	c.nodeRef[node] = id
-	return id, sn.generation
+	return id, sn.generation, true
 }
 
 func (c *Server) saveHandle(handle Handle) (id fuse.HandleID) {
@@ -622,11 +748,20 @@ func (n nodeRefcountDropBug) String() string {
 }
 
 // dropNode decreases reference count for node with id by n.
-// If reference count dropped to zero, returns true.
+// If reference count dropped to zero, returns true, except for nodes
+// implementing NodeRetirer: those are retired here via RetireLocked
+// (under c.meta) and forget is returned false so callers do not also call
+// Forget.
 // Note that node is not guaranteed to be non-nil.
 func (c *Server) dropNode(id fuse.NodeID, n uint64) (node Node, forget bool) {
 	c.meta.Lock()
 	defer c.meta.Unlock()
+	if id >= fuse.NodeID(len(c.node)) {
+		// BatchForget items are not validated by serve(); a bogus ID
+		// must not panic the server.
+		c.debug(nodeRefcountDropBug{N: n, Node: id})
+		return nil, false
+	}
 	snode := c.node[id]
 
 	if snode == nil {
@@ -647,10 +782,19 @@ func (c *Server) dropNode(id fuse.NodeID, n uint64) (node Node, forget bool) {
 
 	snode.refs -= n
 	if snode.refs == 0 {
+		// Only invalidateNode/InvalidateEntry/NotifyDelete/NotifyStore/
+		// NotifyRetrieve add to this waitgroup, so this blocks only while
+		// a kernel notification for this node is in flight.
 		snode.wg.Wait()
 		c.node[id] = nil
 		delete(c.nodeRef, snode.node)
 		c.freeNode = append(c.freeNode, id)
+		if r, ok := snode.node.(NodeRetirer); ok {
+			// Under c.meta, like RegisterLocked in saveNode: an entry reply
+			// that already selected this node is refused there.
+			r.RetireLocked()
+			return snode.node, false
+		}
 		return snode.node, true
 	}
 	return nil, false
@@ -1269,6 +1413,9 @@ func (c *Server) handleRequest(ctx context.Context, node Node, snode *serveNode,
 			return err
 		}
 		if err := c.saveLookup(ctx, &s.LookupResponse, snode, r.Name, n2); err != nil {
+			if a, ok := h2.(HandleAbandoner); ok {
+				a.Abandon(ctx)
+			}
 			return err
 		}
 		s.Handle = c.saveHandle(h2)
@@ -1752,7 +1899,11 @@ func (c *Server) saveLookup(ctx context.Context, s *fuse.LookupResponse, snode *
 		s.Attr.Inode = c.dynamicInode(snode.inode, elem)
 	}
 
-	s.Node, s.Generation = c.saveNode(s.Attr.Inode, n2)
+	var ok bool
+	s.Node, s.Generation, ok = c.saveNode(s.Attr.Inode, n2)
+	if !ok {
+		return syscall.ESTALE
+	}
 	return nil
 }
 
@@ -1897,9 +2048,13 @@ func (i notifyDeleteDetail) String() string {
 //   - [ENOENT]: no such entry found
 //   - [EBUSY]: entry is a mountpoint
 //   - [ENOTEMPTY]: entry is a directory, with entries inside it still cached
+//   - [ErrInlineForget]: the server runs with [Config.InlineForget]
 //
 // [Linux kernel commit `451d0f599934fd97faf54a5d7954b518e66192cb`]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=451d0f599934fd97faf54a5d7954b518e66192cb
 func (s *Server) NotifyDelete(parent Node, child Node, name string) error {
+	if s.inlineForget {
+		return ErrInlineForget
+	}
 	s.meta.Lock()
 	parentID, parentOk := s.nodeRef[parent]
 	var childID fuse.NodeID = 0
@@ -1991,8 +2146,12 @@ func (s *Server) NotifyStore(node Node, offset uint64, data []byte) error {
 // NotifyRetrieve gets data from the kernel page cache.
 //
 // Returns fuse.ErrNotCached if the kernel is not currently caching
-// the node.
+// the node, and ErrInlineForget on a server running with
+// Config.InlineForget.
 func (s *Server) NotifyRetrieve(node Node, offset uint64, size uint32) ([]byte, error) {
+	if s.inlineForget {
+		return nil, ErrInlineForget
+	}
 	s.meta.Lock()
 	id, ok := s.nodeRef[node]
 	if ok {

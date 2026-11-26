@@ -3811,6 +3811,77 @@ func TestInvalidateEntry(t *testing.T) {
 	}
 }
 
+type inlineForgetChild struct {
+	retired chan struct{}
+	// stack of the goroutine that called RetireLocked; read after retired closes
+	stack string
+}
+
+var _ fs.NodeRetirer = (*inlineForgetChild)(nil)
+
+func (c *inlineForgetChild) Attr(ctx context.Context, a *fuse.Attr) error {
+	a.Mode = 0o666
+	return nil
+}
+
+func (c *inlineForgetChild) RegisterLocked() bool { return true }
+
+func (c *inlineForgetChild) RetireLocked() {
+	buf := make([]byte, 1<<16)
+	c.stack = string(buf[:runtime.Stack(buf, false)])
+	close(c.retired)
+}
+
+type inlineForgetRoot struct {
+	child *inlineForgetChild
+}
+
+func (r *inlineForgetRoot) Attr(ctx context.Context, a *fuse.Attr) error {
+	a.Mode = 0o600 | os.ModeDir
+	return nil
+}
+
+func (r *inlineForgetRoot) Lookup(ctx context.Context, name string) (fs.Node, error) {
+	if name != "child" {
+		return nil, syscall.ENOENT
+	}
+	return r.child, nil
+}
+
+// The kernel's FORGET for a node whose entry was invalidated must retire it
+// from the request-reading goroutine when InlineForget is set.
+func TestInlineForgetRetiresFromTheRequestReader(t *testing.T) {
+	maybeParallel(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	child := &inlineForgetChild{retired: make(chan struct{})}
+	root := &inlineForgetRoot{child: child}
+	mnt, err := fstestutil.MountedT(t, fstestutil.SimpleFS{Node: root}, &fs.Config{InlineForget: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mnt.Close()
+	control := statHelper.Spawn(ctx, t)
+	defer control.Close()
+
+	var got statResult
+	if err := control.JSON("/").Call(ctx, mnt.Dir+"/child", &got); err != nil {
+		t.Fatalf("calling helper: %v", err)
+	}
+	if err := mnt.Server.InvalidateEntry(root, "child"); err != nil {
+		t.Fatalf("invalidate error: %v", err)
+	}
+
+	select {
+	case <-child.retired:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the node was not retired after its entry was invalidated")
+	}
+	if !strings.Contains(child.stack, "serveForget") {
+		t.Errorf("RetireLocked did not run from the inline forget path:\n%s", child.stack)
+	}
+}
+
 func TestNotifyDelete(t *testing.T) {
 	// This test may see false positive failures when run under
 	// extreme memory pressure.
